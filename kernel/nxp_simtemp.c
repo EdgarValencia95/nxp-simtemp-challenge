@@ -14,9 +14,14 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/random.h>
 
 #define DRIVER_NAME "nxp_simtemp"
 #define DEVICE_NAME "simtemp"
+
+/* Sample flags */
+#define SIMTEMP_FLAG_NEW_SAMPLE         0x01
+#define SIMTEMP_FLAG_THRESHOLD_EXCEEDED 0x02
 
 /* Sample structure returned to user space */
 struct simtemp_sample {
@@ -31,10 +36,57 @@ struct simtemp_device {
     struct miscdevice mdev;
     u32 sampling_ms;
     s32 threshold_mC;
+    s32 base_temp_mC;      /* Base temperature */
+    u32 temp_variation_mC;  /* Temperature variation range */
 };
 
 /* Global device pointer (single instance for now) */
 static struct simtemp_device *simtemp_dev;
+
+/*
+ * Temperature generation logic
+ */
+
+/**
+ * simtemp_generate_sample - Generate a simulated temperature sample
+ * @dev: Device structure
+ * @sample: Output sample structure
+ * 
+ * Generates a realistic temperature value with random variation
+ * and checks against threshold.
+ */
+static void simtemp_generate_sample(struct simtemp_device *dev,
+                                    struct simtemp_sample *sample)
+{
+    u32 random_val;
+    s32 variation;
+
+    /* Get current timestamp */
+    sample->timestamp_ns = ktime_get_ns();
+
+    /* Generate random variation: [-temp_variation_mC, +temp_variation_mC] */
+    random_val = get_random_u32();
+    variation = (s32)(random_val % (2 * dev->temp_variation_mC + 1)) 
+                - dev->temp_variation_mC;
+
+    /* Calculate temperature: base + variation */
+    sample->temp_mC = dev->base_temp_mC + variation;
+
+    /* Set flags */
+    sample->flags = SIMTEMP_FLAG_NEW_SAMPLE;
+
+    /* Check threshold */
+    if (sample->temp_mC > dev->threshold_mC) {
+        sample->flags |= SIMTEMP_FLAG_THRESHOLD_EXCEEDED;
+        pr_warn("simtemp: Temperature threshold exceeded: %d.%03d°C > %d.%03d°C\n",
+                sample->temp_mC / 1000, abs(sample->temp_mC % 1000),
+                dev->threshold_mC / 1000, abs(dev->threshold_mC % 1000));
+    }
+
+    pr_debug("simtemp: Generated sample: temp=%d.%03d°C, flags=0x%02x\n",
+             sample->temp_mC / 1000, abs(sample->temp_mC % 1000),
+             sample->flags);
+}
 
 /*
  * Character device operations
@@ -58,22 +110,27 @@ static ssize_t simtemp_read(struct file *filp, char __user *buf,
     struct simtemp_sample sample;
     int ret;
 
-    pr_info("simtemp: Read requested, count=%zu\n", count);
+    if (!simtemp_dev) {
+        pr_err("simtemp: Device not initialized\n");
+        return -ENODEV;
+    }
 
-    /* For now, return a static sample */
-    sample.timestamp_ns = ktime_get_ns();
-    sample.temp_mC = 42000; /* 42.0°C */
-    sample.flags = 0x01;    /* NEW_SAMPLE flag */
+    pr_debug("simtemp: Read requested, count=%zu\n", count);
 
     if (count < sizeof(sample))
         return -EINVAL;
 
+    /* Generate a fresh temperature sample */
+    simtemp_generate_sample(simtemp_dev, &sample);
+
+    /* Copy to user space */
     ret = copy_to_user(buf, &sample, sizeof(sample));
     if (ret)
         return -EFAULT;
 
-    pr_info("simtemp: Sent sample: temp=%d.%03d°C\n",
-            sample.temp_mC / 1000, sample.temp_mC % 1000);
+    pr_info("simtemp: Sent sample: temp=%d.%03d°C, flags=0x%02x\n",
+            sample.temp_mC / 1000, abs(sample.temp_mC % 1000),
+            sample.flags);
 
     return sizeof(sample);
 }
@@ -113,8 +170,27 @@ static int simtemp_probe(struct platform_device *pdev)
     if (dev->threshold_mC == 0)
         dev->threshold_mC = 45000; /* Default 45.0°C */
 
-    pr_info("simtemp: Configuration: sampling_ms=%u, threshold_mC=%d\n",
-            dev->sampling_ms, dev->threshold_mC);
+    /* New properties for temperature simulation */
+    of_property_read_u32(pdev->dev.of_node, "base-temp-mC", &dev->base_temp_mC);
+    if (dev->base_temp_mC == 0)
+        dev->base_temp_mC = 35000; /* Default 35.0°C */
+
+    of_property_read_u32(pdev->dev.of_node, "temp-variation-mC", 
+                         &dev->temp_variation_mC);
+    if (dev->temp_variation_mC == 0)
+        dev->temp_variation_mC = 10000; /* Default ±10.0°C */
+
+    pr_info("simtemp: Configuration:\n");
+    pr_info("  sampling_ms=%u\n", dev->sampling_ms);
+    pr_info("  threshold_mC=%d (%d.%03d°C)\n", 
+            dev->threshold_mC,
+            dev->threshold_mC / 1000, abs(dev->threshold_mC % 1000));
+    pr_info("  base_temp_mC=%d (%d.%03d°C)\n",
+            dev->base_temp_mC,
+            dev->base_temp_mC / 1000, abs(dev->base_temp_mC % 1000));
+    pr_info("  temp_variation_mC=%u (±%u.%03u°C)\n",
+            dev->temp_variation_mC,
+            dev->temp_variation_mC / 1000, dev->temp_variation_mC % 1000);
 
     /* Register misc device */
     dev->mdev.minor = MISC_DYNAMIC_MINOR;
@@ -145,7 +221,6 @@ static void simtemp_remove(struct platform_device *pdev)
     simtemp_dev = NULL;
 
     pr_info("simtemp: Device removed successfully\n");
-
 }
 
 /* Device Tree match table */
@@ -216,4 +291,4 @@ module_exit(nxp_simtemp_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Edgar Valencia");
 MODULE_DESCRIPTION("NXP Simulated Temperature Sensor Driver");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.2");
