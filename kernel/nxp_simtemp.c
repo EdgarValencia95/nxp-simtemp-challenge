@@ -15,9 +15,15 @@
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/random.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+#include <linux/spinlock.h>
 
 #define DRIVER_NAME "nxp_simtemp"
 #define DEVICE_NAME "simtemp"
+
+/* Ring buffer size (must be power of 2 for efficiency) */
+#define RING_BUFFER_SIZE 64
 
 /* Sample flags */
 #define SIMTEMP_FLAG_NEW_SAMPLE         0x01
@@ -30,18 +36,132 @@ struct simtemp_sample {
     __u32 flags;
 } __attribute__((packed));
 
+/* Ring buffer structure */
+struct simtemp_ring_buffer {
+    struct simtemp_sample samples[RING_BUFFER_SIZE];
+    unsigned int head;  /* Write position */
+    unsigned int tail;  /* Read position */
+    spinlock_t lock;    /* Protects buffer access */
+};
+
 /* Device private data */
 struct simtemp_device {
     struct platform_device *pdev;
     struct miscdevice mdev;
     u32 sampling_ms;
     s32 threshold_mC;
-    s32 base_temp_mC;      /* Base temperature */
-    u32 temp_variation_mC;  /* Temperature variation range */
+    s32 base_temp_mC;
+    u32 temp_variation_mC;
+    
+    /* Ring buffer for samples */
+    struct simtemp_ring_buffer ring_buf;
+    
+    /* High-resolution timer for periodic sampling */
+    struct hrtimer timer;
+    ktime_t timer_interval;
 };
 
 /* Global device pointer (single instance for now) */
 static struct simtemp_device *simtemp_dev;
+
+/*
+ * Ring buffer operations
+ */
+
+/**
+ * ring_buffer_init - Initialize ring buffer
+ * @ring_buf: Ring buffer to initialize
+ */
+static void ring_buffer_init(struct simtemp_ring_buffer *ring_buf)
+{
+    ring_buf->head = 0;
+    ring_buf->tail = 0;
+    spin_lock_init(&ring_buf->lock);
+    memset(ring_buf->samples, 0, sizeof(ring_buf->samples));
+}
+
+/**
+ * ring_buffer_is_empty - Check if ring buffer is empty
+ * @ring_buf: Ring buffer to check
+ * 
+ * Returns: true if empty, false otherwise
+ * Note: Must be called with lock held
+ */
+static bool ring_buffer_is_empty(struct simtemp_ring_buffer *ring_buf)
+{
+    return ring_buf->head == ring_buf->tail;
+}
+
+/**
+ * ring_buffer_is_full - Check if ring buffer is full
+ * @ring_buf: Ring buffer to check
+ * 
+ * Returns: true if full, false otherwise
+ * Note: Must be called with lock held
+ */
+static bool ring_buffer_is_full(struct simtemp_ring_buffer *ring_buf)
+{
+    return ((ring_buf->head + 1) & (RING_BUFFER_SIZE - 1)) == ring_buf->tail;
+}
+
+/**
+ * ring_buffer_put - Add sample to ring buffer
+ * @ring_buf: Ring buffer
+ * @sample: Sample to add
+ * 
+ * Returns: 0 on success, -ENOSPC if buffer is full
+ */
+static int ring_buffer_put(struct simtemp_ring_buffer *ring_buf,
+                           struct simtemp_sample *sample)
+{
+    unsigned long flags;
+    int ret = 0;
+
+    spin_lock_irqsave(&ring_buf->lock, flags);
+
+    if (ring_buffer_is_full(ring_buf)) {
+        /* Buffer full, drop oldest sample (overwrite tail) */
+        ring_buf->tail = (ring_buf->tail + 1) & (RING_BUFFER_SIZE - 1);
+        pr_debug("simtemp: Ring buffer full, dropping oldest sample\n");
+    }
+
+    /* Add new sample at head */
+    memcpy(&ring_buf->samples[ring_buf->head], sample, sizeof(*sample));
+    ring_buf->head = (ring_buf->head + 1) & (RING_BUFFER_SIZE - 1);
+
+    spin_unlock_irqrestore(&ring_buf->lock, flags);
+
+    return ret;
+}
+
+/**
+ * ring_buffer_get - Get sample from ring buffer
+ * @ring_buf: Ring buffer
+ * @sample: Output sample
+ * 
+ * Returns: 0 on success, -EAGAIN if buffer is empty
+ */
+static int ring_buffer_get(struct simtemp_ring_buffer *ring_buf,
+                           struct simtemp_sample *sample)
+{
+    unsigned long flags;
+    int ret = 0;
+
+    spin_lock_irqsave(&ring_buf->lock, flags);
+
+    if (ring_buffer_is_empty(ring_buf)) {
+        ret = -EAGAIN;
+        goto out;
+    }
+
+    /* Get sample from tail */
+    memcpy(sample, &ring_buf->samples[ring_buf->tail], sizeof(*sample));
+    ring_buf->tail = (ring_buf->tail + 1) & (RING_BUFFER_SIZE - 1);
+
+out:
+    spin_unlock_irqrestore(&ring_buf->lock, flags);
+    return ret;
+}
 
 /*
  * Temperature generation logic
@@ -78,7 +198,7 @@ static void simtemp_generate_sample(struct simtemp_device *dev,
     /* Check threshold */
     if (sample->temp_mC > dev->threshold_mC) {
         sample->flags |= SIMTEMP_FLAG_THRESHOLD_EXCEEDED;
-        pr_warn("simtemp: Temperature threshold exceeded: %d.%03d°C > %d.%03d°C\n",
+        pr_debug("simtemp: Temperature threshold exceeded: %d.%03d°C > %d.%03d°C\n",
                 sample->temp_mC / 1000, abs(sample->temp_mC % 1000),
                 dev->threshold_mC / 1000, abs(dev->threshold_mC % 1000));
     }
@@ -89,12 +209,44 @@ static void simtemp_generate_sample(struct simtemp_device *dev,
 }
 
 /*
+ * Timer callback
+ */
+
+/**
+ * simtemp_timer_callback - High-resolution timer callback
+ * @timer: Timer that expired
+ * 
+ * Called periodically to generate and store temperature samples
+ * 
+ * Returns: HRTIMER_RESTART to continue periodic execution
+ */
+static enum hrtimer_restart simtemp_timer_callback(struct hrtimer *timer)
+{
+    struct simtemp_device *dev;
+    struct simtemp_sample sample;
+
+    dev = container_of(timer, struct simtemp_device, timer);
+
+    /* Generate new temperature sample */
+    simtemp_generate_sample(dev, &sample);
+
+    /* Store in ring buffer */
+    ring_buffer_put(&dev->ring_buf, &sample);
+
+    /* Schedule next timer */
+    hrtimer_forward_now(timer, dev->timer_interval);
+
+    return HRTIMER_RESTART;
+}
+
+/*
  * Character device operations
  */
 
 static int simtemp_open(struct inode *inode, struct file *filp)
 {
     pr_info("simtemp: Device opened\n");
+    filp->private_data = simtemp_dev;
     return 0;
 }
 
@@ -107,10 +259,11 @@ static int simtemp_release(struct inode *inode, struct file *filp)
 static ssize_t simtemp_read(struct file *filp, char __user *buf,
                             size_t count, loff_t *f_pos)
 {
+    struct simtemp_device *dev = filp->private_data;
     struct simtemp_sample sample;
     int ret;
 
-    if (!simtemp_dev) {
+    if (!dev) {
         pr_err("simtemp: Device not initialized\n");
         return -ENODEV;
     }
@@ -120,15 +273,25 @@ static ssize_t simtemp_read(struct file *filp, char __user *buf,
     if (count < sizeof(sample))
         return -EINVAL;
 
-    /* Generate a fresh temperature sample */
-    simtemp_generate_sample(simtemp_dev, &sample);
+    /* Try to get sample from ring buffer */
+    ret = ring_buffer_get(&dev->ring_buf, &sample);
+    if (ret) {
+        /* Buffer empty */
+        if (filp->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+        
+        /* For now, generate on-demand if buffer empty */
+        pr_debug("simtemp: Ring buffer empty, generating on-demand sample\n");
+        simtemp_generate_sample(dev, &sample);
+    }
 
     /* Copy to user space */
     ret = copy_to_user(buf, &sample, sizeof(sample));
     if (ret)
         return -EFAULT;
 
-    pr_info("simtemp: Sent sample: temp=%d.%03d°C, flags=0x%02x\n",
+    pr_debug("simtemp: Sent sample: temp=%d.%03d°C, flags=0x%02x\n",
             sample.temp_mC / 1000, abs(sample.temp_mC % 1000),
             sample.flags);
 
@@ -170,7 +333,6 @@ static int simtemp_probe(struct platform_device *pdev)
     if (dev->threshold_mC == 0)
         dev->threshold_mC = 45000; /* Default 45.0°C */
 
-    /* New properties for temperature simulation */
     of_property_read_u32(pdev->dev.of_node, "base-temp-mC", &dev->base_temp_mC);
     if (dev->base_temp_mC == 0)
         dev->base_temp_mC = 35000; /* Default 35.0°C */
@@ -192,6 +354,14 @@ static int simtemp_probe(struct platform_device *pdev)
             dev->temp_variation_mC,
             dev->temp_variation_mC / 1000, dev->temp_variation_mC % 1000);
 
+    /* Initialize ring buffer */
+    ring_buffer_init(&dev->ring_buf);
+
+    /* Initialize and start high-resolution timer */
+    hrtimer_init(&dev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    dev->timer.function = simtemp_timer_callback;
+    dev->timer_interval = ktime_set(0, dev->sampling_ms * 1000000ULL); /* ms to ns */
+    
     /* Register misc device */
     dev->mdev.minor = MISC_DYNAMIC_MINOR;
     dev->mdev.name = DEVICE_NAME;
@@ -206,6 +376,10 @@ static int simtemp_probe(struct platform_device *pdev)
 
     simtemp_dev = dev;
 
+    /* Start the timer */
+    hrtimer_start(&dev->timer, dev->timer_interval, HRTIMER_MODE_REL);
+    pr_info("simtemp: Timer started with %u ms interval\n", dev->sampling_ms);
+
     pr_info("simtemp: Device registered successfully at /dev/%s\n", DEVICE_NAME);
 
     return 0;
@@ -216,6 +390,10 @@ static void simtemp_remove(struct platform_device *pdev)
     struct simtemp_device *dev = platform_get_drvdata(pdev);
 
     pr_info("simtemp: Removing device\n");
+
+    /* Stop and cleanup timer */
+    hrtimer_cancel(&dev->timer);
+    pr_info("simtemp: Timer stopped\n");
 
     misc_deregister(&dev->mdev);
     simtemp_dev = NULL;
@@ -291,4 +469,4 @@ module_exit(nxp_simtemp_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Edgar Valencia");
 MODULE_DESCRIPTION("NXP Simulated Temperature Sensor Driver");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");
