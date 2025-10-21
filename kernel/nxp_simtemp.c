@@ -18,6 +18,9 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
 
 #define DRIVER_NAME "nxp_simtemp"
 #define DEVICE_NAME "simtemp"
@@ -59,6 +62,9 @@ struct simtemp_device {
     /* High-resolution timer for periodic sampling */
     struct hrtimer timer;
     ktime_t timer_interval;
+    
+    /* Wait queue for blocking reads and poll/select */
+    wait_queue_head_t wait_queue;
 };
 
 /* Global device pointer (single instance for now) */
@@ -163,6 +169,24 @@ out:
     return ret;
 }
 
+/**
+ * ring_buffer_has_data - Check if buffer has data (lockless check)
+ * @ring_buf: Ring buffer
+ * 
+ * Returns: true if data available, false otherwise
+ */
+static bool ring_buffer_has_data(struct simtemp_ring_buffer *ring_buf)
+{
+    unsigned long flags;
+    bool has_data;
+
+    spin_lock_irqsave(&ring_buf->lock, flags);
+    has_data = !ring_buffer_is_empty(ring_buf);
+    spin_unlock_irqrestore(&ring_buf->lock, flags);
+
+    return has_data;
+}
+
 /*
  * Temperature generation logic
  */
@@ -233,6 +257,9 @@ static enum hrtimer_restart simtemp_timer_callback(struct hrtimer *timer)
     /* Store in ring buffer */
     ring_buffer_put(&dev->ring_buf, &sample);
 
+    /* Wake up any waiting readers */
+    wake_up_interruptible(&dev->wait_queue);
+
     /* Schedule next timer */
     hrtimer_forward_now(timer, dev->timer_interval);
 
@@ -281,9 +308,20 @@ static ssize_t simtemp_read(struct file *filp, char __user *buf,
             return -EAGAIN;
         }
         
-        /* For now, generate on-demand if buffer empty */
-        pr_debug("simtemp: Ring buffer empty, generating on-demand sample\n");
-        simtemp_generate_sample(dev, &sample);
+        /* Blocking read: wait for data */
+        pr_debug("simtemp: Buffer empty, waiting for data...\n");
+        ret = wait_event_interruptible(dev->wait_queue,
+                                       ring_buffer_has_data(&dev->ring_buf));
+        if (ret)
+            return ret; /* Interrupted by signal */
+        
+        /* Try again after waking up */
+        ret = ring_buffer_get(&dev->ring_buf, &sample);
+        if (ret) {
+            /* Still no data (shouldn't happen) */
+            pr_warn("simtemp: Woke up but buffer still empty\n");
+            return -EAGAIN;
+        }
     }
 
     /* Copy to user space */
@@ -298,11 +336,36 @@ static ssize_t simtemp_read(struct file *filp, char __user *buf,
     return sizeof(sample);
 }
 
+static __poll_t simtemp_poll(struct file *filp, poll_table *wait)
+{
+    struct simtemp_device *dev = filp->private_data;
+    __poll_t mask = 0;
+
+    if (!dev) {
+        pr_err("simtemp: Device not initialized\n");
+        return POLLERR;
+    }
+
+    pr_debug("simtemp: Poll called\n");
+
+    /* Add our wait queue to the poll table */
+    poll_wait(filp, &dev->wait_queue, wait);
+
+    /* Check if data is available */
+    if (ring_buffer_has_data(&dev->ring_buf)) {
+        mask |= POLLIN | POLLRDNORM; /* Data available for reading */
+        pr_debug("simtemp: Poll: data available\n");
+    }
+
+    return mask;
+}
+
 static const struct file_operations simtemp_fops = {
     .owner = THIS_MODULE,
     .open = simtemp_open,
     .release = simtemp_release,
     .read = simtemp_read,
+    .poll = simtemp_poll,
 };
 
 /*
@@ -357,6 +420,10 @@ static int simtemp_probe(struct platform_device *pdev)
     /* Initialize ring buffer */
     ring_buffer_init(&dev->ring_buf);
 
+    /* Initialize wait queue */
+    init_waitqueue_head(&dev->wait_queue);
+    pr_info("simtemp: Wait queue initialized\n");
+
     /* Initialize and start high-resolution timer */
     hrtimer_init(&dev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     dev->timer.function = simtemp_timer_callback;
@@ -394,6 +461,9 @@ static void simtemp_remove(struct platform_device *pdev)
     /* Stop and cleanup timer */
     hrtimer_cancel(&dev->timer);
     pr_info("simtemp: Timer stopped\n");
+
+    /* Wake up any waiting readers before unregistering */
+    wake_up_interruptible(&dev->wait_queue);
 
     misc_deregister(&dev->mdev);
     simtemp_dev = NULL;
@@ -469,4 +539,4 @@ module_exit(nxp_simtemp_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Edgar Valencia");
 MODULE_DESCRIPTION("NXP Simulated Temperature Sensor Driver");
-MODULE_VERSION("0.3");
+MODULE_VERSION("0.4");
