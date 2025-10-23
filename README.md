@@ -163,6 +163,7 @@ sudo rmmod nxp_simtemp
 - **[AI_NOTES.md](docs/AI_NOTES.md)** - Development process and decisions
 - **[DESIGN.md](docs/DESIGN.md)** - Technical design details
 - **[TESTPLAN.md](docs/TESTPLAN.md)** - Testing strategy and results
+- **Demo Video:** [Watch on YouTube](https://drive.google.com/file/d/1Uq5fEQtYhkVCP1npYmgbdLocQ5HTNwB1/view?usp=sharing)
 - **Submission Document:** [NXP_Submission_EdgarValencia.pdf](./docs/Report/NXP_Submission_EdgarValencia.pdf)
 
 ---
