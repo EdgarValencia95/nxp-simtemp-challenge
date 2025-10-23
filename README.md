@@ -9,7 +9,7 @@ A Linux kernel driver that simulates a temperature sensor for testing purposes.
 
 ## What is this?
 
-This project creates a fake temperature sensor in Linux. It has two main parts:
+This project creates a simulated temperature sensor in Linux. It has two main parts:
 
 1. **Kernel Driver** - Creates `/dev/simtemp` device that generates temperature data
 2. **CLI Tool** - Program to read and display temperatures
@@ -163,6 +163,7 @@ sudo rmmod nxp_simtemp
 - **[AI_NOTES.md](docs/AI_NOTES.md)** - Development process and decisions
 - **[DESIGN.md](docs/DESIGN.md)** - Technical design details
 - **[TESTPLAN.md](docs/TESTPLAN.md)** - Testing strategy and results
+- **Submission Document:** [SUBMISSION.docx](./SUBMISSION.docx)
 
 ---
 
